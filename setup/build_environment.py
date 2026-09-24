@@ -28,6 +28,33 @@ def pyqt_sip_abi_version():
                 if m is not None:
                     return m.group(1)
 
+@lru_cache(maxsize=1)
+def qt_version():
+    """Get Qt version as a tuple of integers (major, minor, patch)."""
+    try:
+        raw = subprocess.check_output([QMAKE, '-query', 'QT_VERSION']).decode('utf-8')
+        raw = raw.strip()
+        parts = raw.split('.')
+        return tuple(int(p) for p in parts[:3])
+    except Exception:
+        return (6, 0, 0)
+
+
+def qt_gui_private_linkage():
+    """Return the appropriate Qt::GuiPrivate linkage based on Qt version.
+    
+    In Qt 6.5+, Qt::GuiPrivate is not available as a CMake target.
+    Instead, we need to use the Qt6::GuiPrivate pseudo-target or link
+    against the private headers directly.
+    """
+    version = qt_version()
+    # Qt 6.5+ doesn't have Qt::GuiPrivate as a proper target
+    if version >= (6, 5, 0):
+        return ''
+    return 'Qt::GuiPrivate'
+
+
+
 
 def merge_paths(a, b):
     a = [os.path.normcase(os.path.normpath(x)) for x in a.split(os.pathsep)]

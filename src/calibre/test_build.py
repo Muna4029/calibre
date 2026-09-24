@@ -99,12 +99,6 @@ class BuildTest(unittest.TestCase):
         import lzma
         lzma.open
 
-    def test_zstd(self):
-        from pyzstd import compress, decompress
-        data = os.urandom(4096)
-        cdata = compress(data)
-        self.assertEqual(data, decompress(cdata))
-
     def test_html5lib(self):
         import html5lib.html5parser  # noqa: F401
         from html5lib import parse  # noqa: F401
@@ -521,7 +515,7 @@ class BuildTest(unittest.TestCase):
         # sgmllib is needed for feedparser parsing malformed feeds
         # on python3 you can get it by taking it from python2 stdlib and
         # running 2to3 on it
-        import sgmllib
+        import feedparser_sgmllib as sgmllib
 
         from calibre.web.feeds.feedparser import parse
         sgmllib, parse

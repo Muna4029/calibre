@@ -626,7 +626,7 @@ class Build(Command):
         from setup.parallel_build import cpu_count
         if iswindows or ishaiku:
             return  # Don't have headless operation on these platforms
-        from setup.build_environment import CMAKE, sw
+        from setup.build_environment import CMAKE, sw, qt_gui_private_linkage
         self.info('\n####### Building headless QPA plugin', '#'*7)
         a = absolutize
         headers = a([
@@ -654,10 +654,36 @@ class Build(Command):
         if sw and os.path.exists(os.path.join(sw, 'qt')):
             cmd += ['-DCMAKE_SYSTEM_PREFIX_PATH=' + os.path.join(sw, 'qt').replace(os.sep, '/')]
         os.makedirs(bdir)
+
+        # Copy source files to build directory
+        srcdir = os.path.dirname(sources[0])
+        for src_file in sources + headers + others:
+            if os.path.exists(src_file):
+                shutil.copy2(src_file, bdir)
+
+        # Copy CMakeLists.txt to build directory and replace placeholders
+        src_cmake = os.path.join(srcdir, 'CMakeLists.txt')
+        dest_cmake = os.path.join(bdir, 'CMakeLists.txt')
+        shutil.copy2(src_cmake, dest_cmake)
+        
+        # Read the CMakeLists.txt and replace placeholders
+        with open(dest_cmake, 'r') as f:
+            cmake_content = f.read()
+        
+        # Get Qt private linkage based on version
+        gui_private = qt_gui_private_linkage()
+        core_private = 'Qt::CorePrivate' if gui_private else ''
+        
+        cmake_content = cmake_content.replace('@QT_GUI_PRIVATE@', gui_private)
+        cmake_content = cmake_content.replace('@QT_CORE_PRIVATE@', core_private)
+        
+        with open(dest_cmake, 'w') as f:
+            f.write(cmake_content)
+
         cwd = os.getcwd()
         os.chdir(bdir)
         try:
-            self.check_call(cmd + ['-S', os.path.dirname(sources[0])])
+            self.check_call(cmd + ['-S', bdir])
             self.check_call([self.env.make] + [f'-j{cpu_count or 1}'])
         finally:
             os.chdir(cwd)

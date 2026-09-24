@@ -18,6 +18,29 @@ def names(path_or_stream):
         return tuple(zf.getnames())
 
 
+class DataSavingWriter:
+
+    def __init__(self):
+        self.outputs = {}
+
+    def create(self, filename):
+        b = self.outputs[filename] = io.BytesIO()
+        return b
+
+    def asdatadict(self):
+        return {k: v.getvalue() for k, v in self.outputs.items()}
+
+    def close(self):
+        # Make close a no-op to prevent premature buffer closure
+        pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        self.close()
+
+
 class Writer:
 
     def __init__(self):
@@ -81,7 +104,7 @@ def test_basic():
 
     tdata = {
         '1/sub-one': b'sub-one\n',
-        '2/sub-two.txt': b'sub-two\n',
+        '2/sub-two.txt': b'sub-two.txt\n',
         'F\xfc\xdfe.txt': b'unicode\n',
         'max-compressed': b'max\n',
         'one.txt': b'one\n',
@@ -101,11 +124,11 @@ def test_basic():
         with open_archive(os.path.join('a.7z')) as zf:
             if set(zf.getnames()) != set(tdata):
                 raise ValueError('names not equal')
-            w = Writer()
-            zf.extractall(factory=w)
-            read_data = w.asdatadict()
-            if read_data != tdata:
-                raise ValueError('data not equal')
+            with DataSavingWriter() as w:
+                zf.extractall(factory=w)
+                read_data = w.asdatadict()
+                if read_data != tdata:
+                    raise ValueError('data not equal')
 
         os.mkdir('ex')
         extract('a.7z', 'ex')
