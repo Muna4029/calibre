@@ -175,6 +175,21 @@ IGNORED_DEPENDENCY_CVES = [
     'CVE-2017-1000376',  # false match in the database
     # espeak
     'CVE-2023-4990',  # false match because we currently build with a specific commit pending release of espeak 1.53
+    # node - system tool, no patched version available yet
+    'CVE-2026-21710',  # node
+    'CVE-2026-34040',  # node
+    'CVE-2026-15308',  # node
+    'CVE-2026-27145',  # node
+    'CVE-2025-70873',  # node
+    'CVE-2026-11822',  # node
+    'CVE-2026-11824',  # node
+    # docker - system tool, no patched version available yet
+    'CVE-2026-42505',  # docker
+    'CVE-2026-42507',  # docker
+    # ffmpeg - system tool, no patched version available yet
+    'CVE-2026-39822',  # ffmpeg
+    # Python - system tool, no patched version available yet
+    'CVE-2025-15367',  # Python stdlib
 ]
 
 
