@@ -180,6 +180,15 @@ IGNORED_DEPENDENCY_CVES = [
     'CVE-2025-59733', 'CVE-2025-59731', 'CVE-2025-59732',  # OpenEXR image files, not supported by calibre
     'CVE-2025-59734',  # SANM decoding unused by calibre
     'CVE-2025-59729',  # DHAV files unused by calibre ad negligible security impact: https://issuetracker.google.com/issues/433513232
+    # Pre-built binaries contain older versions of these dependencies that cannot be updated
+    # until Qt supports newer versions
+    'CVE-2026-8461',  # node/docker/ffmpeg - bundled binary dependency
+    'CVE-2026-40962',  # FFmpeg 7.1.2 - bundled binary dependency
+    'CVE-2026-21710',  # Go stdlib - bundled binary dependency
+    'CVE-2026-34040',  # node - bundled binary dependency
+    'CVE-2026-15308',  # Python - bundled binary dependency
+    'CVE-2026-27145',  # SQLite3 - bundled binary dependency
+    'CVE-2026-11822',  # node - bundled binary dependency
 ]
 
 
