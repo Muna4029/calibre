@@ -88,7 +88,9 @@ class TestFetchBackend(unittest.TestCase):
         self.dont_send_response = self.dont_send_body = False
 
     def tearDown(self):
-        self.server.shutdown()
+        if hasattr(self, 'server'):
+            self.server.shutdown()
+        self.server_thread.join(5)
         self.server_thread.join(5)
 
     def test_recipe_browser_qt(self):
