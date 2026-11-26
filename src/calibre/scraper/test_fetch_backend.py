@@ -9,8 +9,6 @@ from threading import Event, Thread
 
 from calibre.constants import iswindows
 
-from .qt import Browser, WebEngineBrowser
-
 is_ci = os.environ.get('CI', '').lower() == 'true'
 skip = ''
 is_sanitized = 'libasan' in os.environ.get('LD_PRELOAD', '')
@@ -22,26 +20,29 @@ elif 'SKIP_QT_BUILD_TEST' in os.environ:
 
 class Handler(http.server.BaseHTTPRequestHandler):
 
-    def __init__(self, test_obj, *a):
-        self.test_obj = test_obj
-        super().__init__(*a)
+    def __init__(self, *a, **kw):
+        # Use the standard BaseHTTPRequestHandler signature and
+        # obtain the test object from the server instance to avoid
+        # non-standard constructor behavior.
+        super().__init__(*a, **kw)
+        self.test_obj = getattr(self.server, 'test_obj', None)
 
     def do_POST(self):
-        if self.test_obj.dont_send_response:
+        if getattr(self.test_obj, 'dont_send_response', False):
             return
         self.do_response()
 
     def do_GET(self):
-        if self.test_obj.dont_send_response:
+        if getattr(self.test_obj, 'dont_send_response', False):
             return
         if self.path == '/favicon.ico':
             self.send_response(http.HTTPStatus.NOT_FOUND)
+            self.end_headers()
             return
         if self.path == '/redirect':
             self.send_response(http.HTTPStatus.FOUND)
             self.send_header('Location', '/redirected')
             self.end_headers()
-            self.flush_headers()
             return
         self.do_response()
 
@@ -49,25 +50,41 @@ class Handler(http.server.BaseHTTPRequestHandler):
         h = {}
         for k, v in self.headers.items():
             h.setdefault(k, []).append(v)
-        self.test_obj.request_count += 1
+        if self.test_obj is not None:
+            self.test_obj.request_count += 1
+            request_count = self.test_obj.request_count
+        else:
+            request_count = 0
         ans = {
             'path': self.path,
             'headers': h,
-            'request_count': self.test_obj.request_count,
+            'request_count': request_count,
             'method': self.command,
         }
         if 'Content-Length' in self.headers:
-            ans['data'] = self.rfile.read(int(self.headers['Content-Length'])).decode()
+            try:
+                length = int(self.headers['Content-Length'])
+            except (ValueError, TypeError):
+                length = 0
+            if length:
+                ans['data'] = self.rfile.read(length).decode()
         data = json.dumps(ans).encode()
         self.send_response(http.HTTPStatus.OK)
         self.send_header('Content-type', 'application/json')
         self.send_header('Content-Length', str(len(data)))
         self.send_header('Set-Cookie', 'sc=1')
         self.end_headers()
-        if self.test_obj.dont_send_body:
-            self.flush_headers()
+        if getattr(self.test_obj, 'dont_send_body', False):
+            # Intentionally do not write the body to simulate a client timeout;
+            # do not call non-standard methods like flush_headers and avoid
+            # raising on broken pipes to keep the server stable.
+            return
         else:
-            self.wfile.write(data)
+            try:
+                self.wfile.write(data)
+            except BrokenPipeError:
+                # Client closed connection; ignore to avoid crashing server
+                pass
 
     def log_request(self, code='-', size='-'):
         pass
@@ -92,10 +109,14 @@ class TestFetchBackend(unittest.TestCase):
         self.server_thread.join(5)
 
     def test_recipe_browser_qt(self):
+        # Import Browser lazily to avoid importing GUI/Qt bindings at module import time
+        from .qt import Browser as Browser
         self.do_recipe_browser_test(Browser)
 
     @unittest.skipIf(iswindows and is_ci, 'WebEngine browser test hangs on windows CI')
     def test_recipe_browser_webengine(self):
+        # Import WebEngineBrowser lazily to avoid importing GUI/Qt bindings at module import time
+        from .qt import WebEngineBrowser as WebEngineBrowser
         self.do_recipe_browser_test(WebEngineBrowser)
 
     def do_recipe_browser_test(self, browser_class):
@@ -178,11 +199,11 @@ class TestFetchBackend(unittest.TestCase):
     def run_server(self):
         from http.server import ThreadingHTTPServer
 
-        def create_handler(*a):
-            ans = Handler(self, *a)
-            return ans
-
-        with ThreadingHTTPServer(('', 0), create_handler) as httpd:
+        # Use the Handler class directly and attach the test object to the server
+        # so handlers can access it via self.server.test_obj. This keeps handler
+        # construction standard and avoids factory-related edge cases.
+        with ThreadingHTTPServer(('', 0), Handler) as httpd:
+            httpd.test_obj = self
             self.server = httpd
             self.port = httpd.server_address[1]
             self.server_started.set()

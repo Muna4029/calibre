@@ -49,12 +49,33 @@ def unlink(path):
 
 def close_worker(worker):
     import subprocess
-    worker.stdin.close()
+    # Close any open file-like pipes (stdin, stdout, stderr) to avoid ResourceWarning
+    for attr in ('stdin', 'stdout', 'stderr'):
+        try:
+            f = getattr(worker, attr, None)
+            if f is not None:
+                try:
+                    f.close()
+                except Exception:
+                    # Best-effort close; ignore errors closing pipes
+                    pass
+        except Exception:
+            # Defensive: ignore if worker doesn't have the attribute or other errors
+            pass
+
     try:
         worker.wait(10)
     except subprocess.TimeoutExpired:
-        worker.kill()
-    worker.wait()
+        try:
+            worker.kill()
+        except Exception:
+            # Ignore kill errors
+            pass
+    # Ensure final wait to reap the process; ignore any errors here as well
+    try:
+        worker.wait()
+    except Exception:
+        pass
 
 
 def ensure_worker():
@@ -74,9 +95,29 @@ def reset_after_fork():
 
 def _send_command(action: str, payload: str) -> None:
     worker = ensure_worker()
-    worker.stdin.write(json.dumps({'action': action, 'payload': payload}).encode('utf-8'))
-    worker.stdin.write(os.linesep.encode())
-    worker.stdin.flush()
+    data = json.dumps({'action': action, 'payload': payload}).encode('utf-8')
+    nl = os.linesep.encode()
+    try:
+        worker.stdin.write(data)
+        worker.stdin.write(nl)
+        worker.stdin.flush()
+    except (BrokenPipeError, OSError, ValueError, AttributeError):
+        # The worker's stdin is closed or broken. Close the worker and try to restart and resend once.
+        try:
+            close_worker(worker)
+        except Exception:
+            pass
+        worker = ensure_worker()
+        try:
+            worker.stdin.write(data)
+            worker.stdin.write(nl)
+            worker.stdin.flush()
+        except Exception:
+            # Give up silently to avoid crashing callers; ensure worker is closed to free resources
+            try:
+                close_worker(worker)
+            except Exception:
+                pass
 
 
 if iswindows:

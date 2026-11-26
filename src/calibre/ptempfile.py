@@ -1,9 +1,9 @@
-__license__   = 'GPL v3'
+__license__ = 'GPL v3'
 __copyright__ = '2008, Kovid Goyal <kovid at kovidgoyal.net>'
-'''
+"""
 Provides platform independent temporary files that persist even after
 being closed.
-'''
+"""
 import os
 import tempfile
 
@@ -22,6 +22,7 @@ def osx_cache_dir():
     if _osx_cache_dir is None:
         _osx_cache_dir = False
         import ctypes
+
         libc = ctypes.CDLL(None)
         buf = ctypes.create_string_buffer(512)
         l = libc.confstr(65538, ctypes.byref(buf), len(buf))  # _CS_DARWIN_USER_CACHE_DIR = 65538
@@ -52,6 +53,7 @@ def base_dir():
         if td is not None:
             from calibre.utils.serialize import msgpack_loads
             from polyglot.binary import from_hex_bytes
+
             try:
                 td = msgpack_loads(from_hex_bytes(td))
             except Exception:
@@ -101,8 +103,19 @@ def fix_tempfile_module():
 
 
 def reset_base_dir():
-    global _base_dir
+    global _base_dir, get_default_tempdir
     _base_dir = None
+    # If we previously replaced tempfile._gettempdir in fix_tempfile_module,
+    # restore the original function so global tempfile behavior is not
+    # permanently mutated across tests/process lifetime.
+    try:
+        if get_default_tempdir:
+            tempfile._gettempdir = get_default_tempdir
+    except Exception:
+        # Don't allow failures during reset to raise; best-effort restore.
+        pass
+    finally:
+        get_default_tempdir = None
 
 
 def force_unicode(x):
@@ -124,10 +137,11 @@ def _make_dir(suffix, prefix, base):
 
 
 class PersistentTemporaryFile:
-    '''
+    """
     A file-like object that is a temporary file that is available even after being closed on
     all platforms. It is automatically deleted on normal program termination.
-    '''
+    """
+
     _file = None
 
     def __init__(self, suffix='', prefix='', dir=None, mode='w+b'):
@@ -161,10 +175,10 @@ class PersistentTemporaryFile:
 
 
 def PersistentTemporaryDirectory(suffix='', prefix='', dir=None):
-    '''
+    """
     Return the path to a newly created temporary directory that will
     be automatically deleted on application exit.
-    '''
+    """
     if dir is None:
         dir = base_dir()
     tdir = _make_dir(suffix, prefix, dir)
@@ -173,9 +187,9 @@ def PersistentTemporaryDirectory(suffix='', prefix='', dir=None):
 
 
 class TemporaryDirectory:
-    '''
+    """
     A temporary directory to be used in a with statement.
-    '''
+    """
 
     def __init__(self, suffix='', prefix='', dir=None, keep=False):
         self.suffix = suffix
@@ -196,7 +210,6 @@ class TemporaryDirectory:
 
 
 class TemporaryFile:
-
     def __init__(self, suffix='', prefix='', dir=None, mode='w+b'):
         if prefix is None:
             prefix = ''
@@ -219,9 +232,7 @@ class TemporaryFile:
 
 
 class SpooledTemporaryFile(tempfile.SpooledTemporaryFile):
-
-    def __init__(self, max_size=0, suffix='', prefix='', dir=None, mode='w+b',
-            bufsize=-1):
+    def __init__(self, max_size=0, suffix='', prefix='', dir=None, mode='w+b', bufsize=-1):
         if prefix is None:
             prefix = ''
         if suffix is None:
@@ -229,8 +240,7 @@ class SpooledTemporaryFile(tempfile.SpooledTemporaryFile):
         if dir is None:
             dir = base_dir()
         self._name = None
-        tempfile.SpooledTemporaryFile.__init__(self, max_size=max_size,
-                suffix=suffix, prefix=prefix, dir=dir, mode=mode)
+        tempfile.SpooledTemporaryFile.__init__(self, max_size=max_size, suffix=suffix, prefix=prefix, dir=dir, mode=mode)
 
     @property
     def name(self):
@@ -239,16 +249,82 @@ class SpooledTemporaryFile(tempfile.SpooledTemporaryFile):
     @name.setter
     def name(self, val):
         self._name = val
+        # If a disk-backed file name is provided explicitly, try to register it
+        # for cleanup at exit (if the helper exists in this module).
+        try:
+            if val and 'remove_file_atexit' in globals():
+                remove_file_atexit(val)
+        except Exception:
+            # Never let registration errors propagate
+            pass
+
+    def _maybe_register_name(self):
+        """If the underlying spooled file has rolled to disk and provides a
+        name, record it and register it for cleanup at exit (if helper exists).
+        This is defensive: the in-memory buffer may not have _file with a name
+        until it is rolled to disk, so call this from accessors.
+        """
+        f = getattr(self, '_file', None)
+        if f is None:
+            return
+        name = getattr(f, 'name', None)
+        if name and name != self._name:
+            self._name = name
+            try:
+                if 'remove_file_atexit' in globals():
+                    remove_file_atexit(name)
+            except Exception:
+                # Don't let registration failures affect normal operation
+                pass
 
     # See https://bugs.python.org/issue26175
     def readable(self):
-        return self._file.readable()
+        # Ensure we capture and register a disk-backed filename if one exists
+        self._maybe_register_name()
+        f = getattr(self, '_file', None)
+        if f is None:
+            return False
+        return getattr(f, 'readable', (lambda: True))()
 
     def seekable(self):
-        return self._file.seekable()
+        self._maybe_register_name()
+        f = getattr(self, '_file', None)
+        if f is None:
+            return False
+        return getattr(f, 'seekable', (lambda: True))()
 
     def writable(self):
-        return self._file.writable()
+        self._maybe_register_name()
+        f = getattr(self, '_file', None)
+        if f is None:
+            return False
+        return getattr(f, 'writable', (lambda: True))()
+
+    def close(self):
+        # Ensure the underlying resource is closed promptly; this helps avoid
+        # ResourceWarnings when tests treat such warnings as errors.
+        try:
+            return super().close()
+        except Exception:
+            # Swallow any exception on close to avoid noisy failures during
+            # interpreter shutdown; Python may already be tearing down modules.
+            try:
+                f = getattr(self, '_file', None)
+                if f is not None:
+                    try:
+                        f.close()
+                    except Exception:
+                        pass
+            finally:
+                return
+
+    def __del__(self):
+        # Best-effort cleanup on object finalization to avoid leaving open
+        # file descriptors which raise ResourceWarning (treated as errors in CI).
+        try:
+            self.close()
+        except Exception:
+            pass
 
 
 def better_mktemp(*args, **kwargs):

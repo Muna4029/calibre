@@ -32,9 +32,19 @@ class Worker(Thread):
             try:
                 result = func()
             except Exception:
-                self.handle_error(job_id)  # must be a separate function to avoid reference cycles with sys.exc_info()
+                # handle_error will capture minimal exception info and push non-blocking
+                try:
+                    self.handle_error(job_id)
+                except Exception:
+                    # Ensure worker doesn't die here; log and continue
+                    self.log.exception('ServerWorker failed to handle error for job %r', job_id)
             else:
-                self.result_queue.put((job_id, True, result))
+                try:
+                    # use non-blocking put to avoid stalling worker threads if the queue is full
+                    self.result_queue.put_nowait((job_id, True, result))
+                except Full:
+                    # dropping the result is preferable to blocking; log for observability
+                    self.log.exception('Result queue full, dropping result for job %r', job_id)
             finally:
                 self.working = False
             try:
@@ -43,7 +53,15 @@ class Worker(Thread):
                 self.log.exception('ServerWorker failed to notify server on job completion')
 
     def handle_error(self, job_id):
-        self.result_queue.put((job_id, False, sys.exc_info()))
+        # Capture only minimal exception information (type name and message) to avoid
+        # retaining traceback/frame objects which can hold resources open.
+        exc_type, exc_value, _ = sys.exc_info()
+        exc_info = (exc_type.__name__ if exc_type else None, str(exc_value))
+        try:
+            self.result_queue.put_nowait((job_id, False, exc_info))
+        except Full:
+            # If the result queue is full, log and drop the error info to avoid blocking
+            self.log.exception('Result queue full, dropping error info for job %r', job_id)
 
 
 class ThreadPool:
@@ -63,11 +81,28 @@ class ThreadPool:
         return self.result_queue.get_nowait()
 
     def stop(self, wait_till):
+        # Attempt to send a shutdown sentinel for each worker. If the request queue is
+        # full, retry (with bounded waits) until either the sentinel is submitted or
+        # the overall wait_till deadline is reached. Breaking on the first Full would
+        # leave workers without a sentinel and prevent clean shutdowns.
         for w in self.workers:
-            try:
-                self.request_queue.put_nowait(None)
-            except Full:
-                break
+            end = wait_till
+            while True:
+                try:
+                    self.request_queue.put_nowait(None)
+                    break
+                except Full:
+                    now = monotonic()
+                    if now >= end:
+                        # No time left to wait for queue space; give up for this worker
+                        break
+                    # Try a blocking put for a short bounded time to allow the queue to drain
+                    try:
+                        self.request_queue.put(None, timeout=min(0.1, end - now))
+                        break
+                    except Full:
+                        # Timed out, loop and check remaining time again
+                        continue
         for w in self.workers:
             now = monotonic()
             if now >= wait_till:

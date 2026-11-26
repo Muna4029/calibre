@@ -908,12 +908,21 @@ OptionRecommendation(name='search_replace',
         from calibre.ptempfile import PersistentTemporaryFile
         self.log(f'Downloading cover from {url!r}')
         br = browser()
-        raw = br.open_novisit(url).read()
+        # Ensure the HTTP response is closed by using a context manager
+        with br.open_novisit(url) as resp:
+            raw = resp.read()
         buf = io.BytesIO(raw)
-        pt = PersistentTemporaryFile('.jpg')
-        pt.close()
-        img = Image.open(buf)
-        img.convert('RGB').save(pt.name)
+        try:
+            pt = PersistentTemporaryFile('.jpg')
+            pt.close()
+            # Image objects should be closed; use context manager provided by PIL
+            with Image.open(buf) as img:
+                img.convert('RGB').save(pt.name)
+        finally:
+            try:
+                buf.close()
+            except Exception:
+                pass
         return pt.name
 
     def read_user_metadata(self):
@@ -1011,12 +1020,13 @@ OptionRecommendation(name='search_replace',
                 os.makedirs(out_dir)
             self.dump_oeb(ret, out_dir)
         if self.input_fmt == 'recipe':
-            zf = ZipFile(os.path.join(self.opts.debug_pipeline,
-                'periodical.downloaded_recipe'), 'w')
-            zf.add_dir(out_dir)
-            with self.input_plugin:
-                self.input_plugin.save_download(zf)
-            zf.close()
+            zf_path = os.path.join(self.opts.debug_pipeline, 'periodical.downloaded_recipe')
+            # Use context manager to ensure the ZipFile is closed even if an
+            # exception occurs while saving download
+            with ZipFile(zf_path, 'w') as zf:
+                zf.add_dir(out_dir)
+                with self.input_plugin:
+                    self.input_plugin.save_download(zf)
 
         self.log.info('Input debug saved to:', out_dir)
 
@@ -1062,216 +1072,228 @@ OptionRecommendation(name='search_replace',
         accelerators = {}
 
         tdir = PersistentTemporaryDirectory('_plumber')
-        stream = self.input if self.input_fmt == 'recipe' else \
-                open(self.input, 'rb')
+        # Ensure any file we open here is closed on all paths. Keep track of a
+        # stream we opened locally so we can close it in a finally block.
+        opened_stream = None
         if self.input_fmt == 'recipe':
+            stream = self.input
             self.opts.original_recipe_input_arg = self.original_input_arg
+        else:
+            opened_stream = open(self.input, 'rb')
+            stream = opened_stream
 
-        if hasattr(self.opts, 'lrf') and self.output_plugin.file_type == 'lrf':
-            self.opts.lrf = True
-        if self.input_fmt == 'azw4' and self.output_plugin.file_type == 'pdf':
-            self.ui_reporter(0.01, 'AZW4 files are simply wrappers around PDF files.'
-                             ' Skipping the conversion and unwrapping the embedded PDF instead')
-            from calibre.ebooks.azw4.reader import unwrap
-            unwrap(stream, self.output)
+        try:
+            if hasattr(self.opts, 'lrf') and self.output_plugin.file_type == 'lrf':
+                self.opts.lrf = True
+            if self.input_fmt == 'azw4' and self.output_plugin.file_type == 'pdf':
+                self.ui_reporter(0.01, 'AZW4 files are simply wrappers around PDF files.'
+                                 ' Skipping the conversion and unwrapping the embedded PDF instead')
+                from calibre.ebooks.azw4.reader import unwrap
+                unwrap(stream, self.output)
+                self.ui_reporter(1.)
+                self.log(self.output_fmt.upper(), 'output written to', self.output)
+                self.flush()
+                return
+
+            self.ui_reporter(0.01, _('Converting input to HTML...'))
+            ir = CompositeProgressReporter(0.01, 0.34, self.ui_reporter)
+            self.input_plugin.report_progress = ir
+            if self.for_regex_wizard:
+                self.input_plugin.for_viewer = True
+            self.output_plugin.specialize_options(self.log, self.opts, self.input_fmt)
+            with self.input_plugin:
+                self.oeb = self.input_plugin(stream, self.opts,
+                                            self.input_fmt, self.log,
+                                            accelerators, tdir)
+                if self.opts.debug_pipeline is not None:
+                    self.dump_input(self.oeb, tdir)
+                    if self.abort_after_input_dump:
+                        return
+                if self.input_fmt in ('recipe', 'downloaded_recipe'):
+                    self.opts_to_mi(self.user_metadata)
+                if not hasattr(self.oeb, 'manifest'):
+                    self.oeb = create_oebbook(
+                        self.log, self.oeb, self.opts,
+                        encoding=self.input_plugin.output_encoding,
+                        for_regex_wizard=self.for_regex_wizard, removed_items=getattr(self.input_plugin, 'removed_items_to_ignore', ()))
+                if self.for_regex_wizard:
+                    return
+                self.input_plugin.postprocess_book(self.oeb, self.opts, self.log)
+                self.opts.is_image_collection = self.input_plugin.is_image_collection
+                pr = CompositeProgressReporter(0.34, 0.67, self.ui_reporter)
+                self.flush()
+                if self.opts.debug_pipeline is not None:
+                    out_dir = os.path.join(self.opts.debug_pipeline, 'parsed')
+                    self.dump_oeb(self.oeb, out_dir)
+                    self.log('Parsed HTML written to:', out_dir)
+                self.input_plugin.specialize(self.oeb, self.opts, self.log,
+                        self.output_fmt)
+
+            pr(0., _('Running transforms on e-book...'))
+
+            self.oeb.plumber_output_format = self.output_fmt or ''
+
+            if self.opts.transform_html_rules:
+                transform_html_rules = self.opts.transform_html_rules
+                if isinstance(transform_html_rules, string_or_bytes):
+                    transform_html_rules = json.loads(transform_html_rules)
+                from calibre.ebooks.html_transform_rules import transform_conversion_book
+                transform_conversion_book(self.oeb, self.opts, transform_html_rules)
+
+            from calibre.ebooks.oeb.transforms.data_url import DataURL
+            DataURL()(self.oeb, self.opts)
+            from calibre.ebooks.oeb.transforms.guide import Clean
+            Clean()(self.oeb, self.opts)
+            pr(0.1)
+            self.flush()
+
+            self.opts.source = self.opts.input_profile
+            self.opts.dest = self.opts.output_profile
+
+            from calibre.ebooks.oeb.transforms.jacket import RemoveFirstImage
+            RemoveFirstImage()(self.oeb, self.opts, self.user_metadata)
+            from calibre.ebooks.oeb.transforms.metadata import MergeMetadata
+            MergeMetadata()(self.oeb, self.user_metadata, self.opts,
+                    override_input_metadata=self.override_input_metadata)
+            pr(0.2)
+            self.flush()
+
+            from calibre.ebooks.oeb.transforms.structure import DetectStructure
+            DetectStructure()(self.oeb, self.opts)
+            pr(0.35)
+            self.flush()
+
+            if self.output_plugin.file_type not in ('epub', 'kepub'):
+                # Remove the toc reference to the html cover, if any, except for
+                # epub, as the epub output plugin will do the right thing with it.
+                item = getattr(self.oeb.toc, 'item_that_refers_to_cover', None)
+                if item is not None and item.count() == 0:
+                    self.oeb.toc.remove(item)
+
+            from calibre.ebooks.oeb.transforms.flatcss import CSSFlattener
+            fbase = self.opts.base_font_size
+            if fbase < 1e-4:
+                fbase = float(self.opts.dest.fbase)
+            fkey = self.opts.font_size_mapping
+            if fkey is None:
+                fkey = self.opts.dest.fkey
+            else:
+                try:
+                    fkey = list(map(float, fkey.split(',')))
+                except Exception:
+                    self.log.error(f'Invalid font size key: {fkey!r} ignoring')
+                    fkey = self.opts.dest.fkey
+
+            from calibre.ebooks.oeb.transforms.jacket import Jacket
+            Jacket()(self.oeb, self.opts, self.user_metadata)
+            pr(0.37)
+            self.flush()
+
+            if self.opts.add_alt_text_to_img:
+                from calibre.ebooks.oeb.transforms.alt_text import AddAltText
+                AddAltText()(self.oeb, self.opts)
+            pr(0.4)
+            self.flush()
+
+            if self.opts.debug_pipeline is not None:
+                out_dir = os.path.join(self.opts.debug_pipeline, 'structure')
+                self.dump_oeb(self.oeb, out_dir)
+                self.log('Structured HTML written to:', out_dir)
+
+            if self.opts.extra_css and os.path.exists(self.opts.extra_css):
+                with open(self.opts.extra_css, 'rb') as f:
+                    self.opts.extra_css = f.read().decode('utf-8')
+
+            oibl = self.opts.insert_blank_line
+            orps  = self.opts.remove_paragraph_spacing
+            if self.output_plugin.file_type == 'lrf':
+                self.opts.insert_blank_line = False
+                self.opts.remove_paragraph_spacing = False
+            line_height = self.opts.line_height
+            if line_height < 1e-4:
+                line_height = None
+
+            if self.opts.linearize_tables and \
+                    self.output_plugin.file_type not in ('mobi', 'lrf'):
+                from calibre.ebooks.oeb.transforms.linearize_tables import LinearizeTables
+                LinearizeTables()(self.oeb, self.opts)
+
+            if self.opts.unsmarten_punctuation:
+                from calibre.ebooks.oeb.transforms.unsmarten import UnsmartenPunctuation
+                UnsmartenPunctuation()(self.oeb, self.opts)
+
+            mobi_file_type = getattr(self.opts, 'mobi_file_type', 'old')
+            needs_old_markup = (self.output_plugin.file_type == 'lit' or (
+                self.output_plugin.file_type == 'mobi' and mobi_file_type == 'old'))
+            transform_css_rules = ()
+            if self.opts.transform_css_rules:
+                transform_css_rules = self.opts.transform_css_rules
+                if isinstance(transform_css_rules, string_or_bytes):
+                    transform_css_rules = json.loads(transform_css_rules)
+            flattener = CSSFlattener(fbase=fbase, fkey=fkey,
+                    lineh=line_height,
+                    untable=needs_old_markup,
+                    unfloat=needs_old_markup,
+                    page_break_on_body=self.output_plugin.file_type in ('mobi',
+                        'lit'),
+                    transform_css_rules=transform_css_rules,
+                    specializer=partial(self.output_plugin.specialize_css_for_output,
+                        self.log, self.opts))
+            flattener(self.oeb, self.opts)
+            self.opts._final_base_font_size = fbase
+
+            self.opts.insert_blank_line = oibl
+            self.opts.remove_paragraph_spacing = orps
+
+            from calibre.ebooks.oeb.transforms.page_margin import RemoveAdobeMargins, RemoveFakeMargins
+            RemoveFakeMargins()(self.oeb, self.log, self.opts)
+            RemoveAdobeMargins()(self.oeb, self.log, self.opts)
+
+            if self.opts.embed_all_fonts:
+                from calibre.ebooks.oeb.transforms.embed_fonts import EmbedFonts
+                EmbedFonts()(self.oeb, self.log, self.opts)
+
+            if self.opts.subset_embedded_fonts and self.output_plugin.file_type != 'pdf':
+                from calibre.ebooks.oeb.transforms.subset import SubsetFonts
+                SubsetFonts()(self.oeb, self.log, self.opts)
+
+            pr(0.9)
+            self.flush()
+
+            from calibre.ebooks.oeb.transforms.trimmanifest import ManifestTrimmer
+
+            self.log.info('Cleaning up manifest...')
+            trimmer = ManifestTrimmer()
+            trimmer(self.oeb, self.opts)
+
+            self.oeb.toc.rationalize_play_orders()
+            pr(1.)
+            self.flush()
+
+            if self.opts.debug_pipeline is not None:
+                out_dir = os.path.join(self.opts.debug_pipeline, 'processed')
+                self.dump_oeb(self.oeb, out_dir)
+                self.log('Processed HTML written to:', out_dir)
+
+            self.log.info(f'Creating {self.output_plugin.name}...')
+            our = CompositeProgressReporter(0.67, 1., self.ui_reporter)
+            self.output_plugin.report_progress = our
+            our(0., _('Running %s plugin')%self.output_plugin.name)
+            with self.output_plugin:
+                self.output_plugin.convert(self.oeb, self.output, self.input_plugin,
+                    self.opts, self.log)
+            self.oeb.clean_temp_files()
             self.ui_reporter(1.)
+            run_plugins_on_postprocess(self.output, self.output_fmt)
+
             self.log(self.output_fmt.upper(), 'output written to', self.output)
             self.flush()
-            return
-
-        self.ui_reporter(0.01, _('Converting input to HTML...'))
-        ir = CompositeProgressReporter(0.01, 0.34, self.ui_reporter)
-        self.input_plugin.report_progress = ir
-        if self.for_regex_wizard:
-            self.input_plugin.for_viewer = True
-        self.output_plugin.specialize_options(self.log, self.opts, self.input_fmt)
-        with self.input_plugin:
-            self.oeb = self.input_plugin(stream, self.opts,
-                                        self.input_fmt, self.log,
-                                        accelerators, tdir)
-            if self.opts.debug_pipeline is not None:
-                self.dump_input(self.oeb, tdir)
-                if self.abort_after_input_dump:
-                    return
-            if self.input_fmt in ('recipe', 'downloaded_recipe'):
-                self.opts_to_mi(self.user_metadata)
-            if not hasattr(self.oeb, 'manifest'):
-                self.oeb = create_oebbook(
-                    self.log, self.oeb, self.opts,
-                    encoding=self.input_plugin.output_encoding,
-                    for_regex_wizard=self.for_regex_wizard, removed_items=getattr(self.input_plugin, 'removed_items_to_ignore', ()))
-            if self.for_regex_wizard:
-                return
-            self.input_plugin.postprocess_book(self.oeb, self.opts, self.log)
-            self.opts.is_image_collection = self.input_plugin.is_image_collection
-            pr = CompositeProgressReporter(0.34, 0.67, self.ui_reporter)
-            self.flush()
-            if self.opts.debug_pipeline is not None:
-                out_dir = os.path.join(self.opts.debug_pipeline, 'parsed')
-                self.dump_oeb(self.oeb, out_dir)
-                self.log('Parsed HTML written to:', out_dir)
-            self.input_plugin.specialize(self.oeb, self.opts, self.log,
-                    self.output_fmt)
-
-        pr(0., _('Running transforms on e-book...'))
-
-        self.oeb.plumber_output_format = self.output_fmt or ''
-
-        if self.opts.transform_html_rules:
-            transform_html_rules = self.opts.transform_html_rules
-            if isinstance(transform_html_rules, string_or_bytes):
-                transform_html_rules = json.loads(transform_html_rules)
-            from calibre.ebooks.html_transform_rules import transform_conversion_book
-            transform_conversion_book(self.oeb, self.opts, transform_html_rules)
-
-        from calibre.ebooks.oeb.transforms.data_url import DataURL
-        DataURL()(self.oeb, self.opts)
-        from calibre.ebooks.oeb.transforms.guide import Clean
-        Clean()(self.oeb, self.opts)
-        pr(0.1)
-        self.flush()
-
-        self.opts.source = self.opts.input_profile
-        self.opts.dest = self.opts.output_profile
-
-        from calibre.ebooks.oeb.transforms.jacket import RemoveFirstImage
-        RemoveFirstImage()(self.oeb, self.opts, self.user_metadata)
-        from calibre.ebooks.oeb.transforms.metadata import MergeMetadata
-        MergeMetadata()(self.oeb, self.user_metadata, self.opts,
-                override_input_metadata=self.override_input_metadata)
-        pr(0.2)
-        self.flush()
-
-        from calibre.ebooks.oeb.transforms.structure import DetectStructure
-        DetectStructure()(self.oeb, self.opts)
-        pr(0.35)
-        self.flush()
-
-        if self.output_plugin.file_type not in ('epub', 'kepub'):
-            # Remove the toc reference to the html cover, if any, except for
-            # epub, as the epub output plugin will do the right thing with it.
-            item = getattr(self.oeb.toc, 'item_that_refers_to_cover', None)
-            if item is not None and item.count() == 0:
-                self.oeb.toc.remove(item)
-
-        from calibre.ebooks.oeb.transforms.flatcss import CSSFlattener
-        fbase = self.opts.base_font_size
-        if fbase < 1e-4:
-            fbase = float(self.opts.dest.fbase)
-        fkey = self.opts.font_size_mapping
-        if fkey is None:
-            fkey = self.opts.dest.fkey
-        else:
-            try:
-                fkey = list(map(float, fkey.split(',')))
-            except Exception:
-                self.log.error(f'Invalid font size key: {fkey!r} ignoring')
-                fkey = self.opts.dest.fkey
-
-        from calibre.ebooks.oeb.transforms.jacket import Jacket
-        Jacket()(self.oeb, self.opts, self.user_metadata)
-        pr(0.37)
-        self.flush()
-
-        if self.opts.add_alt_text_to_img:
-            from calibre.ebooks.oeb.transforms.alt_text import AddAltText
-            AddAltText()(self.oeb, self.opts)
-        pr(0.4)
-        self.flush()
-
-        if self.opts.debug_pipeline is not None:
-            out_dir = os.path.join(self.opts.debug_pipeline, 'structure')
-            self.dump_oeb(self.oeb, out_dir)
-            self.log('Structured HTML written to:', out_dir)
-
-        if self.opts.extra_css and os.path.exists(self.opts.extra_css):
-            with open(self.opts.extra_css, 'rb') as f:
-                self.opts.extra_css = f.read().decode('utf-8')
-
-        oibl = self.opts.insert_blank_line
-        orps  = self.opts.remove_paragraph_spacing
-        if self.output_plugin.file_type == 'lrf':
-            self.opts.insert_blank_line = False
-            self.opts.remove_paragraph_spacing = False
-        line_height = self.opts.line_height
-        if line_height < 1e-4:
-            line_height = None
-
-        if self.opts.linearize_tables and \
-                self.output_plugin.file_type not in ('mobi', 'lrf'):
-            from calibre.ebooks.oeb.transforms.linearize_tables import LinearizeTables
-            LinearizeTables()(self.oeb, self.opts)
-
-        if self.opts.unsmarten_punctuation:
-            from calibre.ebooks.oeb.transforms.unsmarten import UnsmartenPunctuation
-            UnsmartenPunctuation()(self.oeb, self.opts)
-
-        mobi_file_type = getattr(self.opts, 'mobi_file_type', 'old')
-        needs_old_markup = (self.output_plugin.file_type == 'lit' or (
-            self.output_plugin.file_type == 'mobi' and mobi_file_type == 'old'))
-        transform_css_rules = ()
-        if self.opts.transform_css_rules:
-            transform_css_rules = self.opts.transform_css_rules
-            if isinstance(transform_css_rules, string_or_bytes):
-                transform_css_rules = json.loads(transform_css_rules)
-        flattener = CSSFlattener(fbase=fbase, fkey=fkey,
-                lineh=line_height,
-                untable=needs_old_markup,
-                unfloat=needs_old_markup,
-                page_break_on_body=self.output_plugin.file_type in ('mobi',
-                    'lit'),
-                transform_css_rules=transform_css_rules,
-                specializer=partial(self.output_plugin.specialize_css_for_output,
-                    self.log, self.opts))
-        flattener(self.oeb, self.opts)
-        self.opts._final_base_font_size = fbase
-
-        self.opts.insert_blank_line = oibl
-        self.opts.remove_paragraph_spacing = orps
-
-        from calibre.ebooks.oeb.transforms.page_margin import RemoveAdobeMargins, RemoveFakeMargins
-        RemoveFakeMargins()(self.oeb, self.log, self.opts)
-        RemoveAdobeMargins()(self.oeb, self.log, self.opts)
-
-        if self.opts.embed_all_fonts:
-            from calibre.ebooks.oeb.transforms.embed_fonts import EmbedFonts
-            EmbedFonts()(self.oeb, self.log, self.opts)
-
-        if self.opts.subset_embedded_fonts and self.output_plugin.file_type != 'pdf':
-            from calibre.ebooks.oeb.transforms.subset import SubsetFonts
-            SubsetFonts()(self.oeb, self.log, self.opts)
-
-        pr(0.9)
-        self.flush()
-
-        from calibre.ebooks.oeb.transforms.trimmanifest import ManifestTrimmer
-
-        self.log.info('Cleaning up manifest...')
-        trimmer = ManifestTrimmer()
-        trimmer(self.oeb, self.opts)
-
-        self.oeb.toc.rationalize_play_orders()
-        pr(1.)
-        self.flush()
-
-        if self.opts.debug_pipeline is not None:
-            out_dir = os.path.join(self.opts.debug_pipeline, 'processed')
-            self.dump_oeb(self.oeb, out_dir)
-            self.log('Processed HTML written to:', out_dir)
-
-        self.log.info(f'Creating {self.output_plugin.name}...')
-        our = CompositeProgressReporter(0.67, 1., self.ui_reporter)
-        self.output_plugin.report_progress = our
-        our(0., _('Running %s plugin')%self.output_plugin.name)
-        with self.output_plugin:
-            self.output_plugin.convert(self.oeb, self.output, self.input_plugin,
-                self.opts, self.log)
-        self.oeb.clean_temp_files()
-        self.ui_reporter(1.)
-        run_plugins_on_postprocess(self.output, self.output_fmt)
-
-        self.log(self.output_fmt.upper(), 'output written to', self.output)
-        self.flush()
+        finally:
+            if opened_stream is not None:
+                try:
+                    opened_stream.close()
+                except Exception:
+                    pass
 
 
 # This has to be global as create_oebbook can be called from other locations
