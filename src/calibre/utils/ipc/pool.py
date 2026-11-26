@@ -244,10 +244,21 @@ class Pool(Thread):
         else:
             self.common_data = pickle_dumps(event)
             if len(self.common_data) > MAX_SIZE:
-                self.cd_file = PersistentTemporaryFile('pool_common_data')
-                with self.cd_file as f:
+                # Write large common data to a persistent temporary file and store
+                # only the filename to avoid keeping open file descriptors.
+                tmp = PersistentTemporaryFile('pool_common_data')
+                with tmp as f:
                     f.write(self.common_data)
-                self.common_data = pickle_dumps(File(f.name))
+                    f.flush()
+                    fname = f.name
+                # Ensure underlying file object is closed to avoid ResourceWarning.
+                try:
+                    tmp.close()
+                except Exception:
+                    pass
+                # Store filename for later cleanup and send File(filename) to workers.
+                self.cd_file = fname
+                self.common_data = pickle_dumps(File(fname))
             for worker in self.available_workers:
                 try:
                     worker.set_common_data(self.common_data)
@@ -329,9 +340,29 @@ class Pool(Thread):
         self.busy_workers.clear()
         if hasattr(self, 'cd_file'):
             try:
-                os.remove(self.cd_file.name)
-            except OSError:
-                pass
+                # cd_file may be a filename (str) or a file-like object.
+                if isinstance(self.cd_file, str):
+                    fname = self.cd_file
+                else:
+                    fname = getattr(self.cd_file, 'name', None)
+                    try:
+                        self.cd_file.close()
+                    except Exception:
+                        pass
+                if fname:
+                    try:
+                        os.remove(fname)
+                    except OSError:
+                        pass
+            finally:
+                # Attempt to delete attribute to avoid leaving references.
+                try:
+                    delattr(self, 'cd_file')
+                except Exception:
+                    try:
+                        del self.cd_file
+                    except Exception:
+                        pass
 
 
 def worker_main(conn):

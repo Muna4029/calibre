@@ -1555,7 +1555,6 @@ def safe_replace(zipstream, name, datastream, extra_replacements={},
                         are not created.
 
     '''
-    z = ZipFile(zipstream, 'r')
     replacements = {name:datastream}
     replacements.update(extra_replacements)
     names = frozenset(replacements.keys())
@@ -1563,30 +1562,43 @@ def safe_replace(zipstream, name, datastream, extra_replacements={},
 
     def rbytes(name):
         r = replacements[name]
-        if not isinstance(r, bytes):
-            r = r.read()
-        return r
+        # If it's already bytes or bytearray, just return bytes
+        if isinstance(r, (bytes, bytearray)):
+            return bytes(r)
+        # Otherwise treat as a file-like object: read and close it to avoid leaks
+        data = None
+        try:
+            data = r.read()
+        finally:
+            close = getattr(r, 'close', None)
+            if callable(close):
+                try:
+                    r.close()
+                except Exception:
+                    pass
+        return data
 
-    with SpooledTemporaryFile(max_size=100*1024*1024) as temp:
-        ztemp = ZipFile(temp, 'w')
-        for obj in z.infolist():
-            if isinstance(obj.filename, str):
-                obj.flag_bits |= 0x16  # Set isUTF-8 bit
-            if obj.filename in names:
-                ztemp.writestr(obj, rbytes(obj.filename))
-                found.add(obj.filename)
-            else:
-                ztemp.writestr(obj, z.read_raw(obj), raw_bytes=True)
-        if add_missing:
-            for name in names - found:
-                ztemp.writestr(name, rbytes(name))
-        ztemp.close()
-        z.close()
-        temp.seek(0)
-        zipstream.seek(0)
-        zipstream.truncate()
-        shutil.copyfileobj(temp, zipstream)
-        zipstream.flush()
+    # Use context managers to ensure ZipFile objects are closed even on errors
+    with ZipFile(zipstream, 'r') as z:
+        with SpooledTemporaryFile(max_size=100*1024*1024) as temp:
+            with ZipFile(temp, 'w') as ztemp:
+                for obj in z.infolist():
+                    if isinstance(obj.filename, str):
+                        obj.flag_bits |= 0x16  # Set isUTF-8 bit
+                    if obj.filename in names:
+                        ztemp.writestr(obj, rbytes(obj.filename))
+                        found.add(obj.filename)
+                    else:
+                        ztemp.writestr(obj, z.read_raw(obj), raw_bytes=True)
+                if add_missing:
+                    for name in names - found:
+                        ztemp.writestr(name, rbytes(name))
+            # ztemp closed here
+            temp.seek(0)
+            zipstream.seek(0)
+            zipstream.truncate()
+            shutil.copyfileobj(temp, zipstream)
+            zipstream.flush()
 
 
 class PyZipFile(ZipFile):

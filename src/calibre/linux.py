@@ -1223,7 +1223,9 @@ def make_appdata_releases():
     import json
 
     from lxml.builder import E
-    changelog = json.loads(P('changelog.json', data=True))
+    # Ensure the temporary file returned by P() is closed after reading
+    with P('changelog.json', data=True) as _pf:
+        changelog = json.loads(_pf.read())
 
     releases = E.releases()
     for revision in changelog:

@@ -908,12 +908,52 @@ OptionRecommendation(name='search_replace',
         from calibre.ptempfile import PersistentTemporaryFile
         self.log(f'Downloading cover from {url!r}')
         br = browser()
-        raw = br.open_novisit(url).read()
+        resp = None
+        try:
+            resp = br.open_novisit(url)
+            raw = resp.read()
+        except Exception:
+            # Ensure any opened resources are closed on error
+            if resp is not None:
+                try:
+                    resp.close()
+                except Exception:
+                    pass
+            if hasattr(br, 'close'):
+                try:
+                    br.close()
+                except Exception:
+                    pass
+            raise
+        else:
+            # Normal path: close response and browser if available
+            if resp is not None:
+                try:
+                    resp.close()
+                except Exception:
+                    pass
+            if hasattr(br, 'close'):
+                try:
+                    br.close()
+                except Exception:
+                    pass
+
         buf = io.BytesIO(raw)
         pt = PersistentTemporaryFile('.jpg')
-        pt.close()
-        img = Image.open(buf)
-        img.convert('RGB').save(pt.name)
+        try:
+            # Use context manager to ensure PIL image resources are closed
+            with Image.open(buf) as img:
+                img.convert('RGB').save(pt.name)
+        finally:
+            try:
+                buf.close()
+            except Exception:
+                pass
+            # Close the temporary file object's handle if still open
+            try:
+                pt.close()
+            except Exception:
+                pass
         return pt.name
 
     def read_user_metadata(self):
